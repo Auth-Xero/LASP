@@ -22,8 +22,8 @@ SSD1306Wire audioDisplay(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_
 #define USER_BUTTON 0
 #define LED_PIN 35
 
-#define AUDIO_SAMPLES_PER_PACKET 480  
-#define COMPRESSED_PACKET_SIZE 240    
+#define AUDIO_SAMPLES_PER_PACKET 480
+#define COMPRESSED_PACKET_SIZE 240
 #define PACKET_HEADER_SIZE 3
 #define TOTAL_PACKET_SIZE (PACKET_HEADER_SIZE + COMPRESSED_PACKET_SIZE)
 
@@ -34,44 +34,36 @@ SSD1306Wire audioDisplay(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_
 #define FRAME_TYPE_COMMAND 0x67
 #define SERIAL_AUDIO_PACKET_SIZE 486  
 
-const int16_t stepSizeTable[89] = {
-    7, 8, 9, 10, 11, 12, 13, 14, 16, 17,
-    19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
-    50, 55, 60, 66, 73, 80, 88, 97, 107, 118,
-    130, 143, 157, 173, 190, 209, 230, 253, 279, 307,
-    337, 371, 408, 449, 494, 544, 598, 658, 724, 796,
-    876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066,
-    2272, 2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358,
-    5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
-    15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767
-};
+uint8_t ulaw4Encode(int16_t sample) {
 
-const int8_t indexTable[16] = {
-    -1, -1, -1, -1, 2, 4, 6, 8,
-    -1, -1, -1, -1, 2, 4, 6, 8
-};
+    bool sign = (sample < 0);
+    if (sign) sample = -sample;
 
-struct ADPCMState {
-    int16_t prevSample;   
-    int8_t index;         
+    uint8_t encoded;
 
-    void reset() {
-        prevSample = 0;
-        index = 0;
-    }
-};
+    if (sample < 256) encoded = 0;
+    else if (sample < 512) encoded = 1;
+    else if (sample < 1024) encoded = 2;
+    else if (sample < 2048) encoded = 3;
+    else if (sample < 4096) encoded = 4;
+    else if (sample < 8192) encoded = 5;
+    else if (sample < 16384) encoded = 6;
+    else encoded = 7;
 
-ADPCMState encoderState;
+    if (sign) encoded |= 0x08;
+
+    return encoded;
+}
 
 #define TX_QUEUE_SIZE 10
 QueueHandle_t txQueue;
 
 struct TxPacket {
-    uint8_t data[COMPRESSED_PACKET_SIZE];  
+    uint8_t data[COMPRESSED_PACKET_SIZE];
     uint32_t timestamp;
 };
 
-#define SERIAL_BUFFER_SIZE 9600  
+#define SERIAL_BUFFER_SIZE 9600
 uint8_t serialBuffer[SERIAL_BUFFER_SIZE];
 volatile int serialWriteIdx = 0;
 volatile int serialReadIdx = 0;
@@ -127,9 +119,9 @@ enum SerialState {
 };
 
 volatile SerialState serialState = WAITING_FOR_SYNC1;
-uint8_t tempAudioBuffer[AUDIO_SAMPLES_PER_PACKET];  
+uint8_t tempAudioBuffer[AUDIO_SAMPLES_PER_PACKET];
 volatile int tempAudioIndex = 0;
-volatile uint8_t expectedLength = 0;
+volatile uint16_t expectedLength = 0;
 volatile uint8_t calculatedChecksum = 0;
 volatile uint8_t frameType = 0;
 
@@ -139,66 +131,40 @@ unsigned long transmissionStartTime = 0;
 unsigned long protocolErrors = 0;
 unsigned long checksumErrors = 0;
 
-uint8_t encodeADPCM(uint8_t inputSample, ADPCMState* state) {
+void startTestMode(TestMode mode, const char* name);
+void generateTestPattern(uint8_t* buffer);
+void handleCommand(char cmd);
+void handleButton();
+void enterPairingMode();
+void handlePairingMode();
+void sendPairingBeacon();
+void sendPairingConfirmation(uint16_t rxId);
+void sendPairingConfirmation();
+uint8_t calculateChecksum(uint8_t* data, int length);
+void loadPairingInfo();
+void savePairingInfo();
+void updateDisplay();
+void printStatus();
+void printPerformanceReport();
+void initLoRa();
+void storeAudioPacket();
+void lockAudioMode();
+void processSerialByte(uint8_t byte);
+void serialReadTask(void* parameter);
+void transmissionTask(void* parameter);
+void packetBuilderTask(void* parameter);
 
-    int16_t sample = ((int16_t)inputSample - 128) * 256;
-
-    int16_t diff = sample - state->prevSample;
-
-    int16_t step = stepSizeTable[state->index];
-
-    uint8_t code = 0;
-
-    if (diff < 0) {
-        code = 8;  
-        diff = -diff;
-    }
-
-    int16_t diffq = step >> 3;  
-
-    if (diff >= step) {
-        code |= 4;
-        diff -= step;
-        diffq += step;
-    }
-    step >>= 1;  
-    if (diff >= step) {
-        code |= 2;
-        diff -= step;
-        diffq += step;
-    }
-    step >>= 1;  
-    if (diff >= step) {
-        code |= 1;
-        diffq += step;
-    }
-
-    if (code & 8) {
-        state->prevSample -= diffq;
-    } else {
-        state->prevSample += diffq;
-    }
-
-    if (state->prevSample > 32767) state->prevSample = 32767;
-    if (state->prevSample < -32768) state->prevSample = -32768;
-
-    state->index += indexTable[code];
-
-    if (state->index < 0) state->index = 0;
-    if (state->index > 88) state->index = 88;
-
-    return code;
-}
-
-void compressAudioBlock(uint8_t* input, uint8_t* output, ADPCMState* state) {
+void compressAudioBlock(uint8_t* input, uint8_t* output) {
 
     for (int i = 0; i < AUDIO_SAMPLES_PER_PACKET; i += 2) {
 
-        uint8_t code1 = encodeADPCM(input[i], state);
+        int16_t sample1 = ((int16_t)input[i] - 128) * 256;
+        int16_t sample2 = ((int16_t)input[i + 1] - 128) * 256;
 
-        uint8_t code2 = encodeADPCM(input[i + 1], state);
+        uint8_t encoded1 = ulaw4Encode(sample1);
+        uint8_t encoded2 = ulaw4Encode(sample2);
 
-        output[i / 2] = (code2 << 4) | (code1 & 0x0F);
+        output[i / 2] = (encoded2 << 4) | (encoded1 & 0x0F);
     }
 
     samplesCompressed += AUDIO_SAMPLES_PER_PACKET;
@@ -216,15 +182,13 @@ void setup() {
 
     VextON();
 
-    encoderState.reset();
-
     audioDisplay.init();
     audioDisplay.clear();
     audioDisplay.setTextAlignment(TEXT_ALIGN_CENTER);
     audioDisplay.setFont(ArialMT_Plain_16);
     audioDisplay.drawString(64, 10, "LoRa Audio");
     audioDisplay.setFont(ArialMT_Plain_10);
-    audioDisplay.drawString(64, 30, "ADPCM TX");
+    audioDisplay.drawString(64, 30, "4-bit μ-law TX");
     audioDisplay.drawString(64, 45, "Starting...");
     audioDisplay.display();
 
@@ -253,23 +217,26 @@ void setup() {
     }
 
     Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║   LoRa Audio TX - ADPCM COMPRESSION    ║");
+    Serial.println("║   LoRa Audio TX - 4-BIT μ-LAW         ║");
     Serial.println("╠════════════════════════════════════════╣");
     Serial.printf("║ Device ID: 0x%04X                      ║\n", myDeviceId);
     Serial.println("║                                        ║");
-    Serial.println("║ ADPCM COMPRESSION:                     ║");
-    Serial.println("║   4-bit ADPCM (2:1 compression)        ║");
-    Serial.println("║   480 samples per packet!              ║");
+    Serial.println("║ 4-BIT μ-LAW COMPRESSION:               ║");
+    Serial.println("║   4-bit μ-law (stateless)              ║");
+    Serial.println("║   480 samples per packet               ║");
     Serial.println("║   Effective rate: 60ms audio/packet    ║");
+    Serial.println("║   Packet loss resilient!               ║");
+    Serial.println("║   No state corruption on drops         ║");
     Serial.println("║                                        ║");
     Serial.println("║ PROTOCOL SPECIFICATION:                ║");
     Serial.println("║ Audio Packet (486 bytes input):        ║");
-    Serial.println("║   [A5 5A F0 AD] - 4-byte header        ║");
-    Serial.println("║   [LENGTH=480]  - Length byte          ║");
-    Serial.println("║   [480 samples] - Uncompressed audio   ║");
+    Serial.println("║   [61 6F 73 AD] - 4-byte header        ║");
+    Serial.println("║   [LENGTH_HI]   - High byte of length  ║");
+    Serial.println("║   [LENGTH_LO]   - Low byte (480 total) ║");
+    Serial.println("║   [480 samples] - Raw audio            ║");
     Serial.println("║   [CHECKSUM]    - XOR checksum         ║");
     Serial.println("║                                        ║");
-    Serial.println("║ Transmitted: 243 bytes (compressed)    ║");
+    Serial.println("║ Transmitted: 243 bytes (4-bit μ-law)   ║");
     Serial.println("╚════════════════════════════════════════╝\n");
 
     Serial.printf("Frequency: %.1f MHz\n", LORA_FREQUENCY);
@@ -322,13 +289,13 @@ void printPerformanceReport() {
     float avgAirTimeMs = totalAirTimeMicros / (1000.0 * packetsTransmitted);
 
     Serial.println("\n╔═══════════════════════════════════════╗");
-    Serial.println("║     ADPCM PERFORMANCE REPORT           ║");
+    Serial.println("║     4-BIT μ-LAW PERFORMANCE            ║");
     Serial.println("╠═══════════════════════════════════════╣");
     Serial.printf("║ Packets sent: %-24lu ║\n", packetsTransmitted);
     Serial.printf("║ Samples compressed: %-18lu ║\n", samplesCompressed);
-    Serial.printf("║ Compression ratio: 2:1                 ║\n");
+    Serial.println("║ Compression: 4-bit μ-law (stateless)   ║");
     Serial.printf("║ Packet rate: %-20.1f pkt/s ║\n", rate);
-    Serial.printf("║ Required: 16.7 pkt/s (was 33.3)        ║\n");
+    Serial.printf("║ Required: 16.7 pkt/s                   ║\n");
 
     if (rate >= 16.7) {
         Serial.printf("║ Status: ✓ GOOD (%.1f%% margin)        ║\n", ((rate - 16.7) / 16.7) * 100);
@@ -347,7 +314,7 @@ void printPerformanceReport() {
 }
 
 void transmissionTask(void* parameter) {
-    Serial.println("TX task started - ADPCM mode");
+    Serial.println("TX task started - 4-bit μ-law mode");
 
     TxPacket txPkt;
     uint8_t loraPacket[TOTAL_PACKET_SIZE];
@@ -398,7 +365,7 @@ void transmissionTask(void* parameter) {
                     Serial.printf("TX Rate: %.1f pkt/s (avg %.2fms/pkt) - ", rate, avgTxTime);
 
                     if (rate >= 16.7) {
-                        Serial.printf("GOOD (%.1f%% margin) - 480 samples/pkt\n", ((rate - 16.7) / 16.7) * 100);
+                        Serial.printf("GOOD (%.1f%% margin) - 4-bit μ-law\n", ((rate - 16.7) / 16.7) * 100);
                     } else {
                         Serial.printf("SLOW (%.1f%% deficit)\n", ((16.7 - rate) / 16.7) * 100);
                     }
@@ -410,10 +377,10 @@ void transmissionTask(void* parameter) {
 
                 if (packetsTransmitted % 100 == 0) {
                     Serial.printf("TX #%lu: %.2fms air time, Queue: %d, Compressed: %lu samples\n",
-                                  packetsTransmitted, 
-                                  txTimeMicros / 1000.0,
-                                  uxQueueMessagesWaiting(txQueue),
-                                  samplesCompressed);
+                                packetsTransmitted,
+                                txTimeMicros / 1000.0,
+                                uxQueueMessagesWaiting(txQueue),
+                                samplesCompressed);
                 }
             } else {
                 Serial.printf("TX Error: %d\n", state);
@@ -425,7 +392,7 @@ void transmissionTask(void* parameter) {
 }
 
 void packetBuilderTask(void* parameter) {
-    Serial.println("Builder task started - ADPCM compression enabled");
+    Serial.println("Builder task started - 4-bit μ-law compression enabled");
 
     unsigned long lastTestPacket = 0;
     uint8_t uncompressedBuffer[AUDIO_SAMPLES_PER_PACKET];
@@ -450,7 +417,7 @@ void packetBuilderTask(void* parameter) {
                 }
                 portEXIT_CRITICAL(&serialMux);
 
-                compressAudioBlock(uncompressedBuffer, pkt.data, &encoderState);
+                compressAudioBlock(uncompressedBuffer, pkt.data);
 
                 xQueueSend(txQueue, &pkt, 0);
             }
@@ -463,7 +430,7 @@ void packetBuilderTask(void* parameter) {
 
                 generateTestPattern(uncompressedBuffer);
 
-                compressAudioBlock(uncompressedBuffer, pkt.data, &encoderState);
+                compressAudioBlock(uncompressedBuffer, pkt.data);
 
                 xQueueSend(txQueue, &pkt, 0);
                 lastTestPacket = now;
@@ -496,9 +463,9 @@ void serialReadTask(void* parameter) {
         unsigned long now = millis();
         if (now - lastReport > 5000 && bytesProcessed > 0) {
             float bytesPerSec = bytesProcessed / ((now - lastReport) / 1000.0);
-            Serial.printf("Serial: %.0f B/s | Errors: %lu | Checksum: %lu | Lock: %s\n", 
-                          bytesPerSec, protocolErrors, checksumErrors,
-                          audioStreamLocked ? "YES" : "NO");
+            Serial.printf("Serial: %.0f B/s | Errors: %lu | Checksum: %lu | Lock: %s\n",
+                        bytesPerSec, protocolErrors, checksumErrors,
+                        audioStreamLocked ? "YES" : "NO");
             bytesProcessed = 0;
             lastReport = now;
         }
@@ -550,6 +517,7 @@ void processSerialByte(uint8_t byte) {
                     lockAudioMode();
                 }
                 serialState = READING_LENGTH;
+                expectedLength = 0;
             } else if (byte == FRAME_TYPE_COMMAND && !audioStreamLocked) {
                 serialState = READING_COMMAND;
             } else if (byte == FRAME_TYPE_COMMAND && audioStreamLocked) {
@@ -561,21 +529,43 @@ void processSerialByte(uint8_t byte) {
             }
             break;
 
-        case READING_LENGTH: {  
-            expectedLength = byte;
-            calculatedChecksum ^= byte;
+        case READING_LENGTH: {
 
-            uint16_t actualLength = (expectedLength << 1);  
-            if (actualLength == AUDIO_SAMPLES_PER_PACKET) {
-                tempAudioIndex = 0;
-                serialState = READING_AUDIO_DATA;
+            static bool readingHighByte = false;
+            static uint8_t firstByte = 0;
+
+            if (!readingHighByte) {
+                firstByte = byte;
+                calculatedChecksum ^= byte;
+
+                if (firstByte == 240) {
+
+                    expectedLength = 480;
+                    tempAudioIndex = 0;
+                    serialState = READING_AUDIO_DATA;
+                    readingHighByte = false;
+                } else {
+
+                    expectedLength = (uint16_t)firstByte << 8;
+                    readingHighByte = true;
+                }
             } else {
-                Serial.printf("❌ Invalid length: %d (expected %d)\n", actualLength, AUDIO_SAMPLES_PER_PACKET);
-                serialState = WAITING_FOR_SYNC1;
-                protocolErrors++;
+
+                expectedLength |= byte;
+                calculatedChecksum ^= byte;
+                readingHighByte = false;
+
+                if (expectedLength == AUDIO_SAMPLES_PER_PACKET) {
+                    tempAudioIndex = 0;
+                    serialState = READING_AUDIO_DATA;
+                } else {
+                    Serial.printf("❌ Invalid length: %d (expected %d)\n", expectedLength, AUDIO_SAMPLES_PER_PACKET);
+                    serialState = WAITING_FOR_SYNC1;
+                    protocolErrors++;
+                }
             }
             break;
-        }  
+        }
 
         case READING_AUDIO_DATA:
             tempAudioBuffer[tempAudioIndex++] = byte;
@@ -609,7 +599,6 @@ void storeAudioPacket() {
     int space = SERIAL_BUFFER_SIZE - serialBufferLevel;
 
     if (space >= AUDIO_SAMPLES_PER_PACKET) {
-
         for (int i = 0; i < AUDIO_SAMPLES_PER_PACKET; i++) {
             serialBuffer[serialWriteIdx] = tempAudioBuffer[i];
             serialWriteIdx = (serialWriteIdx + 1) % SERIAL_BUFFER_SIZE;
@@ -639,13 +628,12 @@ void lockAudioMode() {
     maxAirTimeMicros = 0;
     minAirTimeMicros = 999999999;
 
-    encoderState.reset();
-
     Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║   🔒 ADPCM STREAM LOCKED 🔒           ║");
+    Serial.println("║   🔒 4-BIT μ-LAW STREAM LOCKED 🔒     ║");
     Serial.println("║                                        ║");
-    Serial.println("║   Compression: 4-bit ADPCM (2:1)       ║");
+    Serial.println("║   Compression: 4-bit μ-law             ║");
     Serial.println("║   480 samples per packet               ║");
+    Serial.println("║   Packet loss resilient                ║");
     Serial.println("║   Commands are now BLOCKED             ║");
     Serial.println("║   Reset device to unlock               ║");
     Serial.println("╚════════════════════════════════════════╝\n");
@@ -667,7 +655,6 @@ void handleCommand(char cmd) {
 
         case '0':
             currentMode = MODE_NONE;
-            encoderState.reset();
             Serial.println("Test stopped");
             break;
 
@@ -705,12 +692,10 @@ void startTestMode(TestMode mode, const char* name) {
     totalAirTimeMicros = 0;
     maxAirTimeMicros = 0;
     minAirTimeMicros = 999999999;
-    encoderState.reset();
-    Serial.printf("Starting %s test with ADPCM compression\n", name);
+    Serial.printf("Starting %s test with 4-bit μ-law compression\n", name);
 }
 
 void generateTestPattern(uint8_t* buffer) {
-
     switch (currentMode) {
         case MODE_SILENCE:
             memset(buffer, 128, AUDIO_SAMPLES_PER_PACKET);
@@ -735,7 +720,7 @@ void generateTestPattern(uint8_t* buffer) {
                 sinePhase += 2 * PI / samplesPerCycle;
                 while (sinePhase > 2 * PI) sinePhase -= 2 * PI;
 
-                sweepFreq += 0.025;  
+                sweepFreq += 0.025;
                 if (sweepFreq > 3000) sweepFreq = 100;
             }
             break;
@@ -772,7 +757,7 @@ void handleButton() {
 }
 
 void initLoRa() {
-    Serial.println("Initializing LoRa radio for ADPCM...");
+    Serial.println("Initializing LoRa radio for 4-bit μ-law...");
 
     int state = radio.begin(
         LORA_FREQUENCY,
@@ -788,7 +773,7 @@ void initLoRa() {
         while (1);
     }
 
-    radio.setRegulatorLDO(); 
+    radio.setRegulatorLDO();
 
     state = radio.setCRC(false);
     if (state != RADIOLIB_ERR_NONE) {
@@ -808,7 +793,7 @@ void initLoRa() {
     radio.setRfSwitchPins(LORA_NSS, RADIOLIB_NC);
 
     delay(100);
-    Serial.println("LoRa radio ready for ADPCM transmission");
+    Serial.println("LoRa radio ready for 4-bit μ-law transmission");
 }
 
 void enterPairingMode() {
@@ -830,14 +815,12 @@ void enterPairingMode() {
 
     serialState = WAITING_FOR_SYNC1;
     tempAudioIndex = 0;
-    encoderState.reset();
 
     digitalWrite(LED_PIN, HIGH);
     Serial.println("Broadcasting beacon...");
 }
 
 void handlePairingMode() {
-
     if (audioStreamLocked) {
         pairingMode = false;
         digitalWrite(LED_PIN, LOW);
@@ -872,15 +855,15 @@ void handlePairingMode() {
             int state = radio.receive(response, sizeof(response), 100);
 
             if (state == RADIOLIB_ERR_NONE) {
-                Serial.printf("Received packet during pairing: %02X %02X\n", 
-                             response[0], response[1]);
+                Serial.printf("Received packet during pairing: %02X %02X\n",
+                            response[0], response[1]);
 
                 if (response[0] == 0xBB && response[1] == 0xBB) {
                     uint16_t responderId = (response[2] << 8) | response[3];
                     uint16_t targetId = (response[4] << 8) | response[5];
 
-                    Serial.printf("Response from receiver: ID=0x%04X, Target=0x%04X\n", 
-                                 responderId, targetId);
+                    Serial.printf("Response from receiver: ID=0x%04X, Target=0x%04X\n",
+                                responderId, targetId);
 
                     if (targetId == myDeviceId) {
                         Serial.printf("Valid response from receiver 0x%04X!\n", responderId);
@@ -913,7 +896,7 @@ void handlePairingMode() {
                         Serial.println("\n╔════════════════════════════════════════╗");
                         Serial.printf("║  ✓ PAIRING SUCCESSFUL!                 ║\n");
                         Serial.printf("║  Paired with receiver: 0x%04X         ║\n", pairedDeviceId);
-                        Serial.println("║  ADPCM audio system ready              ║");
+                        Serial.println("║  4-bit μ-law audio system ready        ║");
                         Serial.println("╚════════════════════════════════════════╝\n");
 
                         pairingMode = false;
@@ -921,11 +904,10 @@ void handlePairingMode() {
 
                         delay(500);
 
-                        return; 
+                        return;
                     }
                 }
             } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
-
                 Serial.printf("Receive error during pairing: %d\n", state);
             }
 
@@ -1011,7 +993,7 @@ void updateDisplay() {
     audioDisplay.setTextAlignment(TEXT_ALIGN_LEFT);
 
     if (audioStreamLocked) {
-        audioDisplay.drawString(0, 0, "🔒ADPCM");
+        audioDisplay.drawString(0, 0, "🔒4b-μlaw");
     } else {
         audioDisplay.drawString(0, 0, "TX");
     }
@@ -1042,7 +1024,7 @@ void updateDisplay() {
             audioDisplay.drawString(64, 40, info);
 
             if (rate >= 16.7) {
-                audioDisplay.drawString(64, 52, "✓ ADPCM 2:1");
+                audioDisplay.drawString(64, 52, "✓ μ-law OK");
             } else {
                 audioDisplay.drawString(64, 52, "⚠ SLOW");
             }
@@ -1057,7 +1039,7 @@ void updateDisplay() {
         audioDisplay.setFont(ArialMT_Plain_16);
         const char* modeStr = "";
         switch (currentMode) {
-            case MODE_SERIAL: modeStr = "ADPCM"; break;
+            case MODE_SERIAL: modeStr = "4b-μlaw"; break;
             case MODE_SILENCE: modeStr = "Silent"; break;
             case MODE_SINE: modeStr = "1kHz"; break;
             case MODE_SWEEP: modeStr = "Sweep"; break;
@@ -1088,19 +1070,19 @@ void updateDisplay() {
 
 void printStatus() {
     Serial.println("\n╔════════════════════════════════════════╗");
-    Serial.println("║       ADPCM SYSTEM STATUS              ║");
+    Serial.println("║       4-BIT μ-LAW SYSTEM STATUS        ║");
     Serial.println("╠════════════════════════════════════════╣");
     Serial.printf("║ Device ID: 0x%04X                      ║\n", myDeviceId);
 
     if (audioStreamLocked) {
-        Serial.println("║ Mode: 🔒 ADPCM LOCKED                  ║");
-        Serial.printf("║ Duration: %lu seconds                  ║\n", 
-                      (millis() - firstAudioPacketTime) / 1000);
+        Serial.println("║ Mode: 🔒 4-bit μ-law LOCKED            ║");
+        Serial.printf("║ Duration: %lu seconds                  ║\n",
+                    (millis() - firstAudioPacketTime) / 1000);
     } else {
         Serial.println("║ Mode: Command ready                    ║");
     }
 
-    Serial.println("║ Compression: 4-bit ADPCM (2:1)         ║");
+    Serial.println("║ Compression: 4-bit μ-law (stateless)   ║");
     Serial.printf("║ Samples compressed: %lu                ║\n", samplesCompressed);
 
     if (isPaired) {
