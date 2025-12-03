@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">LASP Audio Streaming</string>
+
+    <!-- Connection -->
+    <string name="connect_device">Connect Device</string>
+    <string name="disconnect">Disconnect</string>
+    <string name="connected">Connected</string>
+    <string name="disconnected">Disconnected</string>
+
+    <!-- Audio Sources -->
+    <string name="microphone_input">Microphone Input</string>
+    <string name="audio_file">Audio File</string>
+    <string name="tone_generator">Tone Generator</string>
+    <string name="morse_code">Morse Code</string>
+
+    <!-- Waveform Types -->
+    <string-array name="waveform_types">
+        <item>Sine Wave</item>
+        <item>Square Wave</item>
+        <item>Sawtooth Wave</item>
+        <item>Triangle Wave</item>
+    </string-array>
+</resources>

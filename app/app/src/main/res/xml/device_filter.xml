@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- USB Serial Devices Filter -->
+    <!-- FTDI -->
+    <usb-device vendor-id="1027" />
+    <!-- Arduino -->
+    <usb-device vendor-id="9025" />
+    <usb-device vendor-id="2341" />
+    <!-- Prolific -->
+    <usb-device vendor-id="1659" />
+    <!-- Silicon Labs CP210x -->
+    <usb-device vendor-id="4292" />
+    <!-- CH340 -->
+    <usb-device vendor-id="6790" />
+    <usb-device vendor-id="1A86" />
+</resources>
