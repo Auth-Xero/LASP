@@ -11,7 +11,7 @@ SSD1306Wire audioDisplay(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_
 #define LORA_BANDWIDTH 500.0
 #define LORA_SPREADING 5
 #define LORA_CODING_RATE 5
-#define LORA_TX_POWER 20
+#define LORA_TX_POWER 21
 #define LORA_PREAMBLE 6
 #define LORA_SYNC_WORD 0x12
 
@@ -803,10 +803,20 @@ void enterPairingMode() {
     }
 
     Serial.println("\n=== PAIRING MODE ===");
+    
+    // Clear existing pairing to allow pairing with a different device
+    if (isPaired) {
+        Serial.printf("Clearing existing pairing with 0x%04X\n", pairedDeviceId);
+        isPaired = false;
+        pairedDeviceId = 0;
+        // Don't save yet - only save if new pairing is successful
+    }
+    
     pairingMode = true;
     pairingStartTime = millis();
     currentMode = MODE_NONE;
 
+    // Clear serial buffers
     portENTER_CRITICAL(&serialMux);
     serialBufferLevel = 0;
     serialReadIdx = 0;
@@ -818,6 +828,7 @@ void enterPairingMode() {
 
     digitalWrite(LED_PIN, HIGH);
     Serial.println("Broadcasting beacon...");
+    Serial.println("Will pair with ANY responding receiver");
 }
 
 void handlePairingMode() {
@@ -831,6 +842,9 @@ void handlePairingMode() {
         Serial.println("Pairing timeout");
         pairingMode = false;
         digitalWrite(LED_PIN, LOW);
+        
+        // If we didn't pair successfully, restore the old pairing if it existed
+        loadPairingInfo();
         return;
     }
 
@@ -844,7 +858,7 @@ void handlePairingMode() {
         digitalWrite(LED_PIN, !digitalRead(LED_PIN));
 
         int remaining = (20000 - (now - pairingStartTime)) / 1000;
-        Serial.printf("Pairing... %ds remaining\n", remaining);
+        Serial.printf("Pairing... %ds remaining (will pair with ANY responding receiver)\n", remaining);
 
         unsigned long listenStart = millis();
         bool responseReceived = false;
@@ -867,6 +881,13 @@ void handlePairingMode() {
 
                     if (targetId == myDeviceId) {
                         Serial.printf("Valid response from receiver 0x%04X!\n", responderId);
+                        
+                        // Clear any existing pairing before setting new one
+                        if (isPaired && pairedDeviceId != responderId) {
+                            Serial.printf("Replacing old pairing (0x%04X) with new receiver (0x%04X)\n", 
+                                        pairedDeviceId, responderId);
+                        }
+                        
                         responseReceived = true;
 
                         Serial.println("Sending confirmation packets...");
@@ -889,6 +910,7 @@ void handlePairingMode() {
                             delay(100);
                         }
 
+                        // Set new pairing
                         pairedDeviceId = responderId;
                         isPaired = true;
                         savePairingInfo();
@@ -905,7 +927,11 @@ void handlePairingMode() {
                         delay(500);
 
                         return;
+                    } else {
+                        Serial.printf("Response was for different TX (0x%04X), ignoring\n", targetId);
                     }
+                } else {
+                    Serial.printf("Unknown packet format during pairing\n");
                 }
             } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
                 Serial.printf("Receive error during pairing: %d\n", state);
@@ -915,7 +941,7 @@ void handlePairingMode() {
         }
 
         if (!responseReceived) {
-            Serial.println("No response received this cycle");
+            // Don't spam the console with this message
         }
     }
 }

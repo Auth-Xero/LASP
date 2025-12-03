@@ -12,7 +12,7 @@ SSD1306Wire audioDisplay(0x3c, 500000, SDA_OLED, SCL_OLED, GEOMETRY_128_64, RST_
 #define LORA_BANDWIDTH 500.0
 #define LORA_SPREADING 5
 #define LORA_CODING_RATE 5
-#define LORA_TX_POWER 20
+#define LORA_TX_POWER 21
 #define LORA_PREAMBLE 6
 #define LORA_SYNC_WORD 0x12
 
@@ -351,7 +351,7 @@ void loop() {
     unsigned long now = millis();
 
     if (now - lastButtonCheck > 50) {
-
+        //handleButton();
         lastButtonCheck = now;
     }
 
@@ -925,23 +925,55 @@ void handleButton() {
     static unsigned long buttonPressStart = 0;
     static bool buttonPressed = false;
     static bool longPressHandled = false;
+    static bool veryLongPressHandled = false;
 
     if (digitalRead(USER_BUTTON) == LOW) {
         if (!buttonPressed) {
             buttonPressed = true;
             buttonPressStart = millis();
             longPressHandled = false;
-        } else if (!longPressHandled && millis() - buttonPressStart > 3000 && !pairingMode) {
-            Serial.println("Button held - entering pairing mode");
-            enterPairingMode();
-            longPressHandled = true;
+            veryLongPressHandled = false;
+        } else {
+            unsigned long pressDuration = millis() - buttonPressStart;
+            
+            // Very long press (5+ seconds) - force clear pairing and enter pairing mode
+            if (!veryLongPressHandled && pressDuration > 5000) {
+                Serial.println("\n=== FORCE PAIRING MODE ===");
+                Serial.println("Clearing ALL pairing data...");
+                
+                // Force clear pairing
+                isPaired = false;
+                pairedDeviceId = 0;
+                
+                // Clear EEPROM
+                EEPROM.write(0, 0x00);
+                EEPROM.write(1, 0x00);
+                EEPROM.write(2, 0x00);
+                EEPROM.commit();
+                
+                Serial.println("Pairing cleared - entering pairing mode");
+                enterPairingMode();
+                veryLongPressHandled = true;
+            }
+            // Normal long press (3+ seconds) - enter pairing mode
+            else if (!longPressHandled && pressDuration > 3000 && !pairingMode && !veryLongPressHandled) {
+                Serial.println("Button held 3s - entering pairing mode");
+                enterPairingMode();
+                longPressHandled = true;
+            }
         }
     } else {
-        if (buttonPressed && !longPressHandled) {
-            printStatusReport();
+        if (buttonPressed) {
+            unsigned long pressDuration = millis() - buttonPressStart;
+            
+            // Short press - print status
+            if (!longPressHandled && !veryLongPressHandled && pressDuration < 3000) {
+                printStatusReport();
+            }
         }
         buttonPressed = false;
         longPressHandled = false;
+        veryLongPressHandled = false;
     }
 }
 
@@ -991,6 +1023,7 @@ void initLoRa() {
 void enterPairingMode() {
     Serial.println("\n=== ENTERING PAIRING MODE ===");
 
+    // Stop audio playback and clear buffers
     portENTER_CRITICAL(&bufferMux);
     audioPlaying = false;
     bufferLevel = 0;
@@ -1001,25 +1034,48 @@ void enterPairingMode() {
     xQueueReset(audioPacketQueue);
     initAdaptiveParams();
 
+    // Clear existing pairing to allow pairing with ANY transmitter
+    if (isPaired) {
+        Serial.printf("Clearing existing pairing with 0x%04X\n", pairedDeviceId);
+    }
+    
     pairingMode = true;
     pairingStartTime = millis();
-    isPaired = false;
-    pairedDeviceId = 0;
+    isPaired = false;  // Clear pairing flag
+    pairedDeviceId = 0;  // Clear paired device ID
 
-    EEPROM.write(0, 0);
+    // Clear EEPROM pairing - don't save until new pairing succeeds
+    EEPROM.write(0, 0x00);  // Clear the valid flag
+    EEPROM.write(1, 0x00);
+    EEPROM.write(2, 0x00);
     EEPROM.commit();
 
+    // Reset radio to ensure clean state
+    radio.standby();
+    delay(100);
+    radio.startReceive();
+
     updateLed(true, true);
-    Serial.println("Listening for transmitter beacon...");
+    Serial.println("Cleared old pairing - listening for ANY transmitter beacon...");
+    Serial.println("Will accept pairing from any transmitter");
 }
 
 void handlePairingMode() {
     if (millis() - pairingStartTime > 30000) {
-        Serial.println("Pairing timeout");
+        Serial.println("Pairing timeout - no transmitter found");
         pairingMode = false;
         updateLed(true, false);
+        
+        // Restore previous pairing if it existed
+        loadPairingInfo();
+        if (isPaired) {
+            Serial.printf("Restored previous pairing with 0x%04X\n", pairedDeviceId);
+        }
+        
+        // Restart receiving
         radio.standby();
         delay(50);
+        radio.startReceive();
         return;
     }
 
@@ -1029,70 +1085,117 @@ void handlePairingMode() {
         lastBlink = millis();
 
         int remaining = (30000 - (millis() - pairingStartTime)) / 1000;
-        Serial.printf("Listening for beacons... %d seconds remaining\n", remaining);
+        Serial.printf("Listening for ANY transmitter... %d seconds remaining\n", remaining);
     }
 
     uint8_t beacon[10];
     int state = radio.receive(beacon, sizeof(beacon), 100);
 
     if (state == RADIOLIB_ERR_NONE) {
+        // Check if this is a beacon packet
         if (beacon[0] == 0xAA && beacon[1] == 0xAA) {
             uint16_t beaconId = (beacon[2] << 8) | beacon[3];
             uint8_t deviceType = beacon[4];
 
+            // Check if it's from a transmitter (device type 0x01)
             if (deviceType == 0x01) {
-                Serial.printf("Found transmitter: 0x%04X\n", beaconId);
+                Serial.printf("\n✓ Found transmitter: 0x%04X\n", beaconId);
+                
+                // IMPORTANT: We accept ANY transmitter during pairing mode
+                Serial.printf("Accepting pairing from transmitter 0x%04X\n", beaconId);
 
+                // Send response immediately
                 uint8_t response[6];
-                response[0] = 0xBB;
+                response[0] = 0xBB;  // Response marker
                 response[1] = 0xBB;
-                response[2] = (myDeviceId >> 8) & 0xFF;
+                response[2] = (myDeviceId >> 8) & 0xFF;  // Our ID (receiver)
                 response[3] = myDeviceId & 0xFF;
-                response[4] = (beaconId >> 8) & 0xFF;
+                response[4] = (beaconId >> 8) & 0xFF;    // Their ID (transmitter we're responding to)
                 response[5] = beaconId & 0xFF;
 
+                // Transmit response
                 int txState = radio.transmit(response, sizeof(response));
                 if (txState == RADIOLIB_ERR_NONE) {
-                    Serial.println("Response sent");
+                    Serial.println("Response sent to transmitter");
+                } else {
+                    Serial.printf("Failed to send response: %d\n", txState);
                 }
 
+                // Go back to receive mode to listen for confirmation
                 radio.startReceive();
 
-                Serial.println("Waiting for confirmation...");
+                Serial.println("Waiting for confirmation from transmitter...");
                 unsigned long confirmStart = millis();
                 bool confirmed = false;
+                int confirmationsReceived = 0;
 
+                // Wait for confirmation packets (TX sends multiple)
                 while (millis() - confirmStart < 5000 && !confirmed) {
                     uint8_t confirm[10];
                     state = radio.receive(confirm, sizeof(confirm), 100);
 
                     if (state == RADIOLIB_ERR_NONE) {
+                        // Check if this is a confirmation packet
                         if (confirm[0] == 0xCC && confirm[1] == 0xCC) {
                             uint16_t txId = (confirm[2] << 8) | confirm[3];
                             uint16_t rxId = (confirm[4] << 8) | confirm[5];
 
+                            // Verify the confirmation is for us from the transmitter we responded to
                             if (rxId == myDeviceId && txId == beaconId) {
-                                pairedDeviceId = beaconId;
-                                isPaired = true;
-                                savePairingInfo();
+                                confirmationsReceived++;
+                                Serial.printf("Confirmation %d received from 0x%04X\n", 
+                                            confirmationsReceived, txId);
 
-                                Serial.println("\n✓ PAIRING SUCCESSFUL!");
-                                Serial.printf("Paired with: 0x%04X\n\n", pairedDeviceId);
+                                if (!confirmed) {
+                                    // Set new pairing
+                                    pairedDeviceId = beaconId;
+                                    isPaired = true;
+                                    savePairingInfo();
 
-                                pairingMode = false;
-                                updateLed(true, false);
+                                    Serial.println("\n╔════════════════════════════════════════╗");
+                                    Serial.println("║      ✓ PAIRING SUCCESSFUL!            ║");
+                                    Serial.printf("║  Paired with transmitter: 0x%04X      ║\n", pairedDeviceId);
+                                    Serial.println("║  4-bit μ-law audio ready               ║");
+                                    Serial.println("╚════════════════════════════════════════╝\n");
 
-                                radio.standby();
-                                delay(100);
-                                confirmed = true;
+                                    confirmed = true;
+                                    pairingMode = false;
+                                    updateLed(true, false);
+
+                                    // Give time for any remaining confirmations
+                                    delay(500);
+                                    
+                                    // Restart normal receiving
+                                    radio.standby();
+                                    delay(100);
+                                    radio.startReceive();
+                                }
+                            } else {
+                                Serial.printf("Confirmation was for different RX (0x%04X) or from different TX (0x%04X)\n", 
+                                            rxId, txId);
                             }
                         }
+                    } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
+                        // Ignore timeout errors during confirmation wait
+                        Serial.printf("Error during confirmation wait: %d\n", state);
                     }
 
                     vTaskDelay(10 / portTICK_PERIOD_MS);
                 }
+
+                if (!confirmed) {
+                    Serial.println("No confirmation received - pairing failed");
+                    // Continue in pairing mode to try again
+                }
+            } else {
+                Serial.printf("Beacon from non-transmitter device type: 0x%02X\n", deviceType);
             }
+        } else {
+            // Not a beacon packet
+            Serial.printf("Non-beacon packet received: %02X %02X\n", beacon[0], beacon[1]);
         }
+    } else if (state != RADIOLIB_ERR_RX_TIMEOUT) {
+        Serial.printf("Receive error: %d\n", state);
     }
 }
 
